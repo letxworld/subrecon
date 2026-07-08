@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 )
 
 // requiredTool maps a CLI binary name to its Go install path
@@ -24,11 +25,17 @@ var tools = []requiredTool{
 func main() {
 	domain := flag.String("d", "", "target domain (required)")
 	save := flag.Bool("s", false, "save results to disk under results/<domain>/")
+	output := flag.String("o", "", "custom output file path for live hosts (overrides -s default location)")
+	rateLimit := flag.Int("rl", 150, "max requests per second for httpx (rate limit)")
+	timeout := flag.Int("timeout", 10, "per-request timeout in seconds for httpx")
 	flag.Parse()
 
 	if *domain == "" {
-		fmt.Println("Usage: subrecon -d target.com [-s]")
-		fmt.Println("  -s   save results to disk (results/<domain>/). Without -s, output prints to terminal only.")
+		fmt.Println("Usage: subrecon -d target.com [-s] [-o output.txt] [-rl 150] [-timeout 10]")
+		fmt.Println("  -s          save results to disk (results/<domain>/)")
+		fmt.Println("  -o          custom output file path for live hosts")
+		fmt.Println("  -rl         max requests per second for httpx (default 150)")
+		fmt.Println("  -timeout    per-request timeout in seconds (default 10)")
 		os.Exit(1)
 	}
 
@@ -36,13 +43,13 @@ func main() {
 
 	fmt.Printf("[*] Starting recon on: %s\n", *domain)
 
-	subfinderResults := runSubfinder(*domain)
+	subfinderResults := runSubfinder(*domain, *timeout)
 	assetfinderResults := runAssetfinder(*domain)
 
 	allSubdomains := mergeAndDedupe(subfinderResults, assetfinderResults)
 	fmt.Printf("[*] Found %d unique subdomains\n", len(allSubdomains))
 
-	liveHosts := runHttpx(allSubdomains)
+	liveHosts := runHttpx(allSubdomains, *rateLimit, *timeout)
 	fmt.Printf("[*] Found %d live hosts\n\n", len(liveHosts))
 
 	fmt.Println("=== LIVE HOSTS ===")
@@ -51,10 +58,14 @@ func main() {
 	}
 	fmt.Println("==================")
 
-	if *save {
+	switch {
+	case *output != "":
+		writeLines(*output, liveHosts)
+		fmt.Printf("\n[*] Live hosts saved to %s\n", *output)
+	case *save:
 		saveResults(*domain, allSubdomains, liveHosts)
-	} else {
-		fmt.Println("\n[*] Results printed above only, nothing saved. Use -s to save to disk.")
+	default:
+		fmt.Println("\n[*] Results printed above only, nothing saved. Use -s or -o to save to disk.")
 	}
 }
 
@@ -80,9 +91,9 @@ func ensureToolsInstalled() {
 }
 
 // runSubfinder runs subfinder against the domain and returns its output lines
-func runSubfinder(domain string) []string {
+func runSubfinder(domain string, timeout int) []string {
 	fmt.Println("[*] Running subfinder...")
-	cmd := exec.Command("subfinder", "-d", domain, "-silent")
+	cmd := exec.Command("subfinder", "-d", domain, "-silent", "-timeout", strconv.Itoa(timeout))
 	return runAndCollectLines(cmd)
 }
 
@@ -94,10 +105,18 @@ func runAssetfinder(domain string) []string {
 }
 
 // runHttpx probes a list of subdomains for live hosts, returns formatted result lines
-func runHttpx(subdomains []string) []string {
-	fmt.Println("[*] Probing for live hosts with httpx...")
+// rateLimit caps max requests/sec, timeout caps per-request wait time - both forwarded to httpx directly
+func runHttpx(subdomains []string, rateLimit int, timeout int) []string {
+	fmt.Printf("[*] Probing for live hosts with httpx (rate-limit: %d/s, timeout: %ds)...\n", rateLimit, timeout)
 
-	cmd := exec.Command("httpx", "-silent", "-status-code", "-title", "-tech-detect")
+	cmd := exec.Command("httpx",
+		"-silent",
+		"-status-code",
+		"-title",
+		"-tech-detect",
+		"-rate-limit", strconv.Itoa(rateLimit),
+		"-timeout", strconv.Itoa(timeout),
+	)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		fmt.Printf("[!] Failed to create httpx stdin pipe: %v\n", err)
